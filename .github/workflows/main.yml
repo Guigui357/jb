@@ -115,31 +115,33 @@ jobs:
 
       - name: Build jbd (arm64e)
         run: |
+          set -euo pipefail
           xcrun --sdk iphoneos clang \
             -arch arm64e \
             -mios-version-min=${{ env.SDK_TARGET }} \
             -O2 \
             -o jbd \
             JailbreakApp/jbd.c
+          test -f jbd
+          file jbd
 
       - name: Sign jbd with ldid
         run: |
           set -euo pipefail
           brew install ldid
           JBD="$(pwd)/jbd"
-          if [ ! -f "$JBD" ]; then
-            echo "ERROR: $JBD not found"; ls -la "$(pwd)"; exit 1
-          fi
+          test -f "$JBD" || { echo "ERROR: $JBD not found"; ls -la "$(pwd)"; exit 1; }
           chmod +x "$JBD"
           ldid -S "$JBD"
-          ldid -e "$JBD" >/dev/null && echo "ldid: entitlements OK"
-          file "$JBD"
+          ldid -e "$JBD" >/dev/null
+          echo "ldid: entitlements OK"
 
       - name: Upload jbd artifact
         uses: actions/upload-artifact@v4
         with:
           name: jbd-daemon
           path: jbd
+          if-no-files-found: error
           retention-days: 30
 
   build-app:
@@ -657,6 +659,7 @@ jobs:
 
       - name: Build unsigned app
         run: |
+          set -euo pipefail
           xcodebuild \
             -project JailbreakApp.xcodeproj \
             -scheme JailbreakApp \
@@ -691,15 +694,23 @@ jobs:
         with:
           name: xcodebuild-log
           path: xcodebuild.log
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Locate .app
         if: success()
         id: locate
         run: |
-          APP=$(find build/Build/Products -name 'JailbreakApp.app' -type d | head -n1)
+          set -euo pipefail
+          APP=$(find build/Build/Products -maxdepth 3 -name 'JailbreakApp.app' -type d | head -n1)
+          if [ -z "$APP" ]; then
+            echo "ERROR: JailbreakApp.app not found"
+            find build/Build/Products -maxdepth 4 -print
+            exit 1
+          fi
           echo "app_path=$APP" >> "$GITHUB_OUTPUT"
           echo "Found: $APP"
+          ls -la "$APP"
 
       - name: Upload unsigned app
         if: success()
@@ -707,6 +718,8 @@ jobs:
         with:
           name: JailbreakApp-unsigned
           path: ${{ steps.locate.outputs.app_path }}
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 30
 
   package-ipa:
@@ -718,7 +731,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: JailbreakApp-unsigned
-          path: Payload
+          path: raw-app
 
       - name: Download daemon
         uses: actions/download-artifact@v4
@@ -729,19 +742,35 @@ jobs:
       - name: Normalize Payload layout
         run: |
           set -euo pipefail
-          echo "== before =="
-          find Payload -maxdepth 3 -print
-          # download-artifact may nest as Payload/JailbreakApp.app or
-          # Payload/JailbreakApp-unsigned/JailbreakApp.app — flatten the latter.
-          if [ ! -d "Payload/JailbreakApp.app" ]; then
-            NESTED=$(find Payload -maxdepth 2 -type d -name 'JailbreakApp.app' | head -n1)
-            if [ -z "$NESTED" ]; then
-              echo "ERROR: no JailbreakApp.app under Payload"; find Payload -print; exit 1
-            fi
-            mv "$NESTED" Payload/JailbreakApp.app
+          echo "== raw-app contents =="
+          find raw-app -maxdepth 3 -print | sort
+
+          mkdir -p Payload
+
+          WRAPPED=$(find raw-app -maxdepth 4 -type d -name 'JailbreakApp.app' | head -n1)
+
+          if [ -n "$WRAPPED" ]; then
+            echo "[normalize] wrapped layout found at: $WRAPPED"
+            rm -rf Payload/JailbreakApp.app
+            mv "$WRAPPED" Payload/JailbreakApp.app
+          else
+            echo "[normalize] flat layout detected; rewrapping into JailbreakApp.app"
+            rm -rf Payload/JailbreakApp.app
+            mkdir -p Payload/JailbreakApp.app
+            shopt -s dotglob nullglob
+            for entry in raw-app/*; do
+              mv "$entry" Payload/JailbreakApp.app/
+            done
+            shopt -u dotglob nullglob
           fi
-          echo "== after =="
-          find Payload -maxdepth 3 -print
+
+          echo "== Payload after normalization =="
+          find Payload -maxdepth 3 -print | sort
+
+          test -f Payload/JailbreakApp.app/Info.plist || { echo "ERROR: Info.plist missing"; exit 1; }
+          test -f Payload/JailbreakApp.app/JailbreakApp || { echo "ERROR: JailbreakApp binary missing"; ls -la Payload/JailbreakApp.app; exit 1; }
+          chmod +x Payload/JailbreakApp.app/JailbreakApp
+          echo "[normalize] OK"
 
       - name: Write entitlements.plist
         run: |
@@ -774,17 +803,20 @@ jobs:
           APP_BIN="$(pwd)/Payload/JailbreakApp.app/JailbreakApp"
           JBD_BIN="$(pwd)/Payload/JailbreakApp.app/jbd"
           for f in "$ENT" "$APP_BIN" "$JBD_BIN"; do
-            if [ ! -f "$f" ]; then echo "ERROR: missing $f"; exit 1; fi
+            test -f "$f" || { echo "ERROR: missing $f"; exit 1; }
           done
           chmod +x "$APP_BIN"
           ldid -S"$ENT" "$APP_BIN"
           ldid -S "$JBD_BIN"
+          echo "== app entitlements =="
           ldid -e "$APP_BIN" | head -n 40
+          echo "== jbd entitlements =="
           ldid -e "$JBD_BIN" | head -n 40
           echo "signing OK"
 
       - name: Zip IPA
         run: |
+          set -euo pipefail
           zip -r JailbreakApp-unsigned.ipa Payload
           shasum -a 256 JailbreakApp-unsigned.ipa | tee JailbreakApp-unsigned.ipa.sha256
 
@@ -795,6 +827,7 @@ jobs:
           path: |
             JailbreakApp-unsigned.ipa
             JailbreakApp-unsigned.ipa.sha256
+          if-no-files-found: error
           retention-days: 90
 
   release:
