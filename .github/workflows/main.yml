@@ -517,19 +517,36 @@ jobs:
 
           @end
           EOF
-
-      - name: Write AppDelegate.m
+  
+      - name: Write main.m
         run: |
-          cat > JailbreakApp/AppDelegate.m <<'EOF'
+          cat > JailbreakApp/main.m <<'EOF'
           #import <UIKit/UIKit.h>
-          #import "jb_core.h"
+          #import "AppDelegate.h"
 
-          @interface ViewController : UIViewController
-          @end
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil,
+                                           NSStringFromClass([AppDelegate class]));
+              }
+          }
+          EOF
+
+      - name: Write AppDelegate.h
+        run: |
+          cat > JailbreakApp/AppDelegate.h <<'EOF'
+          #import <UIKit/UIKit.h>
 
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
           @property (nonatomic, strong) UIWindow *window;
           @end
+          EOF
+
+      - name: Write AppDelegate.m
+        run: |
+          cat > JailbreakApp/AppDelegate.m <<'EOF'
+          #import "AppDelegate.h"
+          #import "ViewController.h"
 
           @implementation AppDelegate
           - (BOOL)application:(UIApplication *)app
