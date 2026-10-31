@@ -395,14 +395,20 @@ jobs:
           }
           EOF
 
-      - name: Write ViewController.m
+      - name: Write ViewController.h
         run: |
-          cat > JailbreakApp/ViewController.m <<'EOF'
+          cat > JailbreakApp/ViewController.h <<'EOF'
           #import <UIKit/UIKit.h>
-          #import "jb_core.h"
 
           @interface ViewController : UIViewController
           @end
+          EOF
+
+      - name: Write ViewController.m
+        run: |
+          cat > JailbreakApp/ViewController.m <<'EOF'
+          #import "ViewController.h"
+          #import "jb_core.h"
 
           @interface ViewController ()
           @property (nonatomic, strong) UITextView *terminal;
@@ -517,20 +523,6 @@ jobs:
 
           @end
           EOF
-  
-      - name: Write main.m
-        run: |
-          cat > JailbreakApp/main.m <<'EOF'
-          #import <UIKit/UIKit.h>
-          #import "AppDelegate.h"
-
-          int main(int argc, char *argv[]) {
-              @autoreleasepool {
-                  return UIApplicationMain(argc, argv, nil,
-                                           NSStringFromClass([AppDelegate class]));
-              }
-          }
-          EOF
 
       - name: Write AppDelegate.h
         run: |
@@ -557,6 +549,20 @@ jobs:
               return YES;
           }
           @end
+          EOF
+
+      - name: Write main.m
+        run: |
+          cat > JailbreakApp/main.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import "AppDelegate.h"
+
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil,
+                                           NSStringFromClass([AppDelegate class]));
+              }
+          }
           EOF
 
       - name: Write Info.plist
@@ -597,6 +603,14 @@ jobs:
             bundleIdPrefix: com.example
             deploymentTarget:
               iOS: "18.2"
+            createIntermediateGroups: true
+          settings:
+            base:
+              CLANG_ENABLE_EXPLICIT_MODULES: NO
+              CLANG_ENABLE_MODULES: NO
+              SWIFT_VERSION: ""
+              SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+              ENABLE_MODULE_VERIFIER: NO
           targets:
             JailbreakApp:
               type: application
@@ -617,6 +631,10 @@ jobs:
                   OTHER_CFLAGS: "-fno-objc-arc"
                   CLANG_WARN_IMPLICIT_FUNCTION_DECLARATION: NO
                   GCC_WARN_UNDECLARED_SELECTOR: NO
+                  SWIFT_VERSION: ""
+                  CLANG_ENABLE_EXPLICIT_MODULES: NO
+                  CLANG_ENABLE_MODULES: NO
+                  ENABLE_MODULE_VERIFIER: NO
               info:
                 path: JailbreakApp/Info.plist
           EOF
@@ -644,9 +662,32 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             ARCHS="${{ env.ARCH }}" \
             IPHONEOS_DEPLOYMENT_TARGET="${{ env.SDK_TARGET }}" \
-            build
+            CLANG_ENABLE_EXPLICIT_MODULES=NO \
+            CLANG_ENABLE_MODULES=NO \
+            SWIFT_VERSION="" \
+            SWIFT_OPTIMIZATION_LEVEL="-Onone" \
+            ENABLE_MODULE_VERIFIER=NO \
+            OTHER_SWIFT_FLAGS="-Xfrontend -disable-explicit-module-builds" \
+            build | tee xcodebuild.log
+
+      - name: Surface real errors from log
+        if: failure()
+        run: |
+          echo "==== error lines ===="
+          grep -nE "error:|fatal error:|undefined symbol" xcodebuild.log | head -n 100 || true
+          echo "==== last 200 lines ===="
+          tail -n 200 xcodebuild.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          retention-days: 14
 
       - name: Locate .app
+        if: success()
         id: locate
         run: |
           APP=$(find build/Build/Products -name 'JailbreakApp.app' -type d | head -n1)
@@ -654,6 +695,7 @@ jobs:
           echo "Found: $APP"
 
       - name: Upload unsigned app
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: JailbreakApp-unsigned
