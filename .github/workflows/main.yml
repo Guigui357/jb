@@ -124,9 +124,16 @@ jobs:
 
       - name: Sign jbd with ldid
         run: |
+          set -euo pipefail
           brew install ldid
-          ldid -S jbd
-          file jbd
+          JBD="$(pwd)/jbd"
+          if [ ! -f "$JBD" ]; then
+            echo "ERROR: $JBD not found"; ls -la "$(pwd)"; exit 1
+          fi
+          chmod +x "$JBD"
+          ldid -S "$JBD"
+          ldid -e "$JBD" >/dev/null && echo "ldid: entitlements OK"
+          file "$JBD"
 
       - name: Upload jbd artifact
         uses: actions/upload-artifact@v4
@@ -711,13 +718,30 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: JailbreakApp-unsigned
-          path: Payload/JailbreakApp.app
+          path: Payload
 
       - name: Download daemon
         uses: actions/download-artifact@v4
         with:
           name: jbd-daemon
           path: payload-bin
+
+      - name: Normalize Payload layout
+        run: |
+          set -euo pipefail
+          echo "== before =="
+          find Payload -maxdepth 3 -print
+          # download-artifact may nest as Payload/JailbreakApp.app or
+          # Payload/JailbreakApp-unsigned/JailbreakApp.app — flatten the latter.
+          if [ ! -d "Payload/JailbreakApp.app" ]; then
+            NESTED=$(find Payload -maxdepth 2 -type d -name 'JailbreakApp.app' | head -n1)
+            if [ -z "$NESTED" ]; then
+              echo "ERROR: no JailbreakApp.app under Payload"; find Payload -print; exit 1
+            fi
+            mv "$NESTED" Payload/JailbreakApp.app
+          fi
+          echo "== after =="
+          find Payload -maxdepth 3 -print
 
       - name: Write entitlements.plist
         run: |
@@ -731,17 +755,33 @@ jobs:
             <key>com.apple.private.skip-library-validation</key><true/>
           </dict></plist>
           EOF
+          plutil -lint entitlements.plist
 
       - name: Bundle daemon into app
         run: |
+          set -euo pipefail
+          test -d Payload/JailbreakApp.app
+          test -f payload-bin/jbd
           cp payload-bin/jbd Payload/JailbreakApp.app/jbd
           chmod +x Payload/JailbreakApp.app/jbd
+          ls -la Payload/JailbreakApp.app
 
       - name: Sign app (ldid)
         run: |
+          set -euo pipefail
           brew install ldid
-          ldid -S entitlements.plist Payload/JailbreakApp.app/JailbreakApp
-          ldid -S Payload/JailbreakApp.app/jbd
+          ENT="$(pwd)/entitlements.plist"
+          APP_BIN="$(pwd)/Payload/JailbreakApp.app/JailbreakApp"
+          JBD_BIN="$(pwd)/Payload/JailbreakApp.app/jbd"
+          for f in "$ENT" "$APP_BIN" "$JBD_BIN"; do
+            if [ ! -f "$f" ]; then echo "ERROR: missing $f"; exit 1; fi
+          done
+          chmod +x "$APP_BIN"
+          ldid -S"$ENT" "$APP_BIN"
+          ldid -S "$JBD_BIN"
+          ldid -e "$APP_BIN" | head -n 40
+          ldid -e "$JBD_BIN" | head -n 40
+          echo "signing OK"
 
       - name: Zip IPA
         run: |
