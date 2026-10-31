@@ -628,6 +628,11 @@ jobs:
                 - path: JailbreakApp
                   excludes:
                     - entitlements.plist
+              dependencies:
+                - sdk: UIKit.framework
+                - sdk: Foundation.framework
+                - sdk: CoreFoundation.framework
+                - sdk: CoreGraphics.framework
               settings:
                 base:
                   INFOPLIST_FILE: JailbreakApp/Info.plist
