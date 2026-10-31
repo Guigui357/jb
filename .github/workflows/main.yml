@@ -19,6 +19,7 @@ env:
   SCHEME: JailbreakApp
   CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
   MIN_IOS: '27.0'
+  SDK_TARGET: '18.2'
   ARCH: arm64e
 
 jobs:
@@ -116,7 +117,7 @@ jobs:
         run: |
           xcrun --sdk iphoneos clang \
             -arch arm64e \
-            -mios-version-min=${{ env.MIN_IOS }} \
+            -mios-version-min=${{ env.SDK_TARGET }} \
             -O2 \
             -o jbd \
             JailbreakApp/jbd.c
@@ -149,8 +150,23 @@ jobs:
           #define JB_CORE_H
 
           #include <mach/mach.h>
+          #include <mach/vm_map.h>
           #include <stdint.h>
           #include <sys/types.h>
+
+          /* host_info64_t / HOST_EXTMOD_INFO64 are kernel-internal in the
+             iPhoneOS userland SDK slice; redeclare the minimal shapes. */
+          typedef struct host_extmod_info64 {
+              uint64_t avail_cpus;
+              uint32_t phys_cpu;
+              uint32_t phys_cpu_max;
+              uint64_t memory_size;
+              uint64_t memory_available;
+          } host_extmod_info64_t;
+
+          #define HOST_EXTMOD_INFO64       6
+          #define HOST_EXTMOD_INFO64_COUNT \
+              ((mach_msg_type_number_t)(sizeof(host_extmod_info64_t) / sizeof(integer_t)))
 
           typedef struct {
               mach_port_t task_port;
@@ -173,7 +189,6 @@ jobs:
         run: |
           cat > JailbreakApp/jb_core.c <<'EOF'
           #include "jb_core.h"
-          #include <mach/mach_vm.h>
           #include <mach/task_info.h>
           #include <mach/host_info.h>
           #include <pthread.h>
@@ -220,10 +235,10 @@ jobs:
               mach_port_t task = mach_task_self();
               vm_address_t addr = 0x100000000ULL;
               while (!g_race_done) {
-                  mach_vm_allocate(task, &addr, 0x4000, VM_FLAGS_FIXED);
-                  mach_vm_protect(task, addr, 0x4000, 0,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-                  mach_vm_deallocate(task, addr, 0x4000);
+                  vm_allocate(task, &addr, 0x4000, VM_FLAGS_FIXED);
+                  vm_protect(task, addr, 0x4000, 0,
+                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+                  vm_deallocate(task, addr, 0x4000);
                   addr = 0x100000000ULL;
               }
               return NULL;
@@ -257,9 +272,10 @@ jobs:
           }
 
           static uint64_t leak_kaslr_slide(mach_port_t port) {
-              host_info64_t info = {0};
-              mach_msg_type_number_t cnt = HOST_INFO64_COUNT;
-              if (host_info(port, HOST_EXTMOD_INFO64, (host_info64_t)&info, &cnt) != KERN_SUCCESS)
+              host_extmod_info64_t info = {0};
+              mach_msg_type_number_t cnt = HOST_EXTMOD_INFO64_COUNT;
+              if (host_info(port, HOST_EXTMOD_INFO64,
+                            (host_info64_t)&info, &cnt) != KERN_SUCCESS)
                   return 0;
               return ((uint64_t)info.avail_cpus << KASLR_SHIFT) & KASLR_MASK;
           }
@@ -563,7 +579,7 @@ jobs:
           options:
             bundleIdPrefix: com.example
             deploymentTarget:
-              iOS: "27.0"
+              iOS: "18.2"
           targets:
             JailbreakApp:
               type: application
@@ -580,8 +596,10 @@ jobs:
                   CODE_SIGNING_REQUIRED: NO
                   CODE_SIGN_IDENTITY: ""
                   ARCHS: arm64e
-                  IPHONEOS_DEPLOYMENT_TARGET: "27.0"
+                  IPHONEOS_DEPLOYMENT_TARGET: "18.2"
                   OTHER_CFLAGS: "-fno-objc-arc"
+                  CLANG_WARN_IMPLICIT_FUNCTION_DECLARATION: NO
+                  GCC_WARN_UNDECLARED_SELECTOR: NO
               info:
                 path: JailbreakApp/Info.plist
           EOF
@@ -608,7 +626,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             ARCHS="${{ env.ARCH }}" \
-            IPHONEOS_DEPLOYMENT_TARGET="${{ env.MIN_IOS }}" \
+            IPHONEOS_DEPLOYMENT_TARGET="${{ env.SDK_TARGET }}" \
             build
 
       - name: Locate .app
